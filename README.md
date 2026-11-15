@@ -164,7 +164,9 @@ The dialog only appears when duplicates actually exist, so it never interrupts a
 
 ### The tree is a superset of the open tabs
 
-Every saved file that is open in Notepad++ has an entry in the panel. A sweep at startup adds whatever a restored session or a command-line file left out, and activating a tab re-adds its entry if it was removed earlier while the document stayed open. The panel knows more than Notepad++ — closed documents stay as history — but never less.
+Every document open in Notepad++ has an entry in the panel, saved files and unsaved buffers alike. A sweep at startup walks every buffer in both views and adds whatever a restored session or a command-line file left out; activating a tab re-adds its entry if it was removed earlier while the document stayed open. The panel knows more than Notepad++ — closed documents stay as history — but never less.
+
+An unsaved buffer is identified by its buffer name, because that is all it has: two untitled documents that Notepad++ happens to name the same way share one entry.
 
 ---
 
