@@ -72,6 +72,20 @@ namespace VirtualTabGroups.Tests
         }
 
         [Fact]
+        public void AddFile_DuplicateUnsavedBufferName_ReturnsNullAndDoesNotDuplicate()
+        {
+            // A restored session can hold two buffers named "new 1"; the entry is
+            // keyed by name, so the second sweep must not add a row.
+            var folder = new FolderNode("");
+            folder.Children.Add(new FileNode("new 1", "new 1"));
+
+            var added = TreeMutator.AddFile(folder, "new 1", atTop: true);
+
+            Assert.Null(added);
+            Assert.Single(folder.Children);
+        }
+
+        [Fact]
         public void RemoveNode_FileInFolder_RemovesFromContainer()
         {
             var root = new FolderNode("");

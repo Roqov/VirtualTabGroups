@@ -171,8 +171,8 @@ namespace VirtualTabGroups.Plugin
                     case NppNotif.NPPN_FILECLOSED:
                         // The document is gone; an indicator it left behind would keep
                         // claiming unsaved changes for a buffer that no longer exists.
+                        // History is already accounted for by the BEFORECLOSE branch.
                         ClearDirtyAfterClose(notification.nmhdr.idFrom);
-                        OnFileClosed(notification.nmhdr.idFrom);
                         break;
 
                     case NppNotif.NPPN_FILEOPENED:
@@ -226,6 +226,10 @@ namespace VirtualTabGroups.Plugin
 
                     case NppNotif.NPPN_FILERENAMED:
                         // Rename from Notepad++'s main window. idFrom = bufferId.
+                        // A rename carries no pre-save path, and a stale one (the Save As
+                        // dialog was cancelled before FILESAVED) would relink an unrelated
+                        // entry to the renamed file.
+                        _pathsBeforeSave.Remove(notification.nmhdr.idFrom);
                         OnFileSavedOrRenamed(notification.nmhdr.idFrom);
                         break;
 
@@ -282,17 +286,8 @@ namespace VirtualTabGroups.Plugin
             // never touch curated entries without the user's consent.
             RemoveDuplicateEntriesIfConfirmed();
 
-            // File entries are history. Saved paths and unsaved buffer names remain in
-            // the user's curated tree even when a buffer did not survive the restart.
-            var openPaths = GetAllOpenFilePaths() ?? Array.Empty<string>();
-            var liveBufferNames = new HashSet<string>(openPaths.Where(p => p != null), StringComparer.OrdinalIgnoreCase);
-            int purgedStale = PurgeDeadUnsavedEntries(_root, liveBufferNames);
-            if (purgedStale > 0)
-            {
-                CrashLog.Write("OnNppReady: preserved " + purgedStale + " history entry(ies); "
-                    + liveBufferNames.Count + " live buffer(s)");
-                _stateStore.MarkDirty(_root, _stateStore.LastSelectedId);
-            }
+            // File entries are history: saved paths and unsaved buffer names stay in
+            // the user's curated tree even when their buffer did not survive a restart.
 
             // Session restore and files passed on the command line fire NPPN_FILEOPENED
             // before NPPN_READY, when there is no tree yet. Sweep once here so no open
@@ -889,19 +884,6 @@ namespace VirtualTabGroups.Plugin
         }
 
         /// <summary>
-        /// Keeps every virtual file entry across Notepad++ tab closes and restarts.
-        /// A saved file can be reopened later through NPPM_DOOPEN. An unsaved buffer
-        /// remains as history too; if its buffer no longer exists, OpenFile reports that
-        /// it cannot be restored instead of silently deleting the user's entry.
-        /// </summary>
-        private static int PurgeDeadUnsavedEntries(FolderNode folder, HashSet<string> liveBufferNames)
-        {
-            // History is intentional. Do not purge unsaved entries merely because the
-            // corresponding buffer did not survive a restart.
-            return 0;
-        }
-
-        /// <summary>
         /// Sweeps every open saved document and adds the ones the tree does not know
         /// about yet. Startup is the main gap: NPPN_FILEOPENED fires before NPPN_READY
         /// for restored sessions and command-line files, when the tree does not exist.
@@ -923,11 +905,16 @@ namespace VirtualTabGroups.Plugin
                 // this a restored scratch buffer stayed invisible until it was clicked.
                 var bufferIds = EnumerateBufferIds();
                 var unsavedNames = new List<string>();
+                var seenNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 int unsavedAdded = 0;
                 foreach (var bufferId in bufferIds)
                 {
                     var name = GetPathForBufferId(bufferId);
                     if (string.IsNullOrEmpty(name) || System.IO.Path.IsPathRooted(name)) continue;
+
+                    // A restored session can hold two buffers under the same placeholder
+                    // name. Entries are keyed by that name, so report it once.
+                    if (!seenNames.Add(name)) continue;
 
                     unsavedNames.Add(name);
                     if (EnsureTrackedUnsavedBuffer(name)) { added++; unsavedAdded++; }
@@ -1242,6 +1229,10 @@ namespace VirtualTabGroups.Plugin
                 bool hadPrevious = _pathsBeforeSave.TryGetValue(bufferId, out previousPath);
                 if (hadPrevious) _pathsBeforeSave.Remove(bufferId);
 
+                // The buffer carries a new path now, so a later close must not clear the
+                // indicator of the path it used to have.
+                _pathsBeforeClose.Remove(bufferId);
+
                 var openPaths = new HashSet<string>(
                     GetAllOpenFilePaths() ?? Array.Empty<string>(),
                     StringComparer.OrdinalIgnoreCase);
@@ -1316,6 +1307,10 @@ namespace VirtualTabGroups.Plugin
         private static void ClearDirtyAfterClose(IntPtr bufferId)
         {
             if (bufferId == IntPtr.Zero) return;
+
+            // The buffer is gone; nothing may stay keyed on it, and a pre-save path
+            // left by a cancelled Save As would relink an unrelated entry later.
+            _pathsBeforeSave.Remove(bufferId);
 
             string path;
             if (!_pathsBeforeClose.TryGetValue(bufferId, out path)) return;
