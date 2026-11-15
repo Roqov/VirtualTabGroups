@@ -22,7 +22,10 @@ namespace VirtualTabGroups.Plugin.Npp
         NPPM_MENUCOMMAND = NPPMSG + 48,
 
         NPPM_GETCURRENTDOCINDEX = NPPMSG + 47,
-        NPPM_GETBUFFERIDFROMPOS = NPPMSG + 1083, // 1024 + 1000 + 59
+        // wParam = 0-based doc index, lParam = view (0 main, 1 sub). The header
+        // defines this as NPPMSG + 59: NPPMSG already contains WM_USER + 1000, so
+        // adding 1083 addressed a message Notepad++ does not handle and returned 0.
+        NPPM_GETBUFFERIDFROMPOS = NPPMSG + 59,
         NPPM_ISDARKMODEENABLED = NPPMSG + 107,
         NPPM_GETDARKMODECOLORS = NPPMSG + 108,
         NPPM_DARKMODESUBCLASSANDTHEME = NPPMSG + 112,

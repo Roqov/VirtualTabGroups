@@ -918,13 +918,89 @@ namespace VirtualTabGroups.Plugin
                     if (EnsureTrackedOpenDocument(path)) added++;
                 }
 
-                if (added > 0)
-                    CrashLog.Write("ReconcileOpenDocuments: added " + added
-                        + " open tab(s) that were missing from the tree");
+                // Unsaved buffers never appear in NPPM_GETOPENFILENAMES, so they are
+                // swept separately by walking both views' buffer positions. Without
+                // this a restored scratch buffer stayed invisible until it was clicked.
+                var bufferIds = EnumerateBufferIds();
+                var unsavedNames = new List<string>();
+                int unsavedAdded = 0;
+                foreach (var bufferId in bufferIds)
+                {
+                    var name = GetPathForBufferId(bufferId);
+                    if (string.IsNullOrEmpty(name) || System.IO.Path.IsPathRooted(name)) continue;
+
+                    unsavedNames.Add(name);
+                    if (EnsureTrackedUnsavedBuffer(name)) { added++; unsavedAdded++; }
+                }
+
+                CrashLog.Write("ReconcileOpenDocuments: checked " + bufferIds.Count
+                    + " buffer(s)" + (unsavedNames.Count > 0
+                        ? " (unsaved: " + string.Join(", ", unsavedNames) + ")"
+                        : " (no unsaved buffers)")
+                    + ", added " + added + " tab(s) of which " + unsavedAdded + " unsaved");
             }
             catch (Exception ex)
             {
                 CrashLog.WriteException("ReconcileOpenDocuments", ex);
+            }
+        }
+
+        private const int MaxBuffersPerView = 512;
+        private const int MainView = 0;
+        private const int SubView = 1;
+
+        /// <summary>
+        /// Every buffer Notepad++ holds, saved or not, taken from both views by
+        /// position. NPPM_GETOPENFILENAMES only reports saved documents, which is why
+        /// unsaved buffers need this walk.
+        /// </summary>
+        private static List<IntPtr> EnumerateBufferIds()
+        {
+            var ids = new List<IntPtr>();
+            var seen = new HashSet<long>();
+
+            for (int view = MainView; view <= SubView; view++)
+            {
+                for (int pos = 0; pos < MaxBuffersPerView; pos++)
+                {
+                    var bufferId = Win32.SendMessage(
+                        _nppData._nppHandle,
+                        (int)NppMsg.NPPM_GETBUFFERIDFROMPOS,
+                        new IntPtr(pos),
+                        new IntPtr(view));
+                    if (bufferId == IntPtr.Zero) break;
+                    if (seen.Add(bufferId.ToInt64())) ids.Add(bufferId);
+                }
+            }
+
+            return ids;
+        }
+
+        /// <summary>
+        /// Adds an unsaved buffer ("new 1", "новый 3") to the top of the tree when its
+        /// name is not tracked yet. Saved buffers are handled by
+        /// <see cref="EnsureTrackedOpenDocument"/> and skipped here.
+        /// </summary>
+        private static bool EnsureTrackedUnsavedBuffer(string name)
+        {
+            if (_root == null || _stateStore == null) return false;
+            if (string.IsNullOrEmpty(name) || System.IO.Path.IsPathRooted(name)) return false;
+            if (IsPathClaimed(_root, name)) return false;
+
+            try
+            {
+                var added = TreeMutator.AddFile(_root, name, atTop: true);
+                if (added == null) return false;
+
+                _stateStore.MarkDirty(_root, _stateStore.LastSelectedId);
+                _panel?.RefreshFromModel();
+                CrashLog.Write("EnsureTrackedUnsavedBuffer: added buffer: " + name);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                CrashLog.WriteException("EnsureTrackedUnsavedBuffer", ex);
+                return false;
             }
         }
 
