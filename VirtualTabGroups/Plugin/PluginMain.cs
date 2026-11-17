@@ -180,6 +180,7 @@ namespace VirtualTabGroups.Plugin
                         // BUFFERACTIVATED notification can expose a placeholder name
                         // (for example "new 1") while Explorer opening is still in
                         // progress; never persist that placeholder here.
+                        RememberBufferPath(notification.nmhdr.idFrom);
                         OnFileOpened(notification.nmhdr.idFrom);
                         break;
 
@@ -205,6 +206,9 @@ namespace VirtualTabGroups.Plugin
                         // New unsaved buffers (Ctrl+N) never fire NPPN_FILEOPENED.
                         // BUFFERACTIVATED also fires transiently while Explorer opens
                         // a saved file, so tracking is delayed until the name settles.
+                        // The path is remembered separately: the save handler can then
+                        // relink even if FILEBEFORESAVE never arrives.
+                        RememberBufferPath(notification.nmhdr.idFrom);
                         OnBufferActivated(notification.nmhdr.idFrom);
                         // The tree follows the active tab. Read-only: no model change.
                         OnActiveBufferChanged(notification.nmhdr.idFrom);
@@ -325,6 +329,7 @@ namespace VirtualTabGroups.Plugin
                 // pre-save/pre-close paths must not outlive the session.
                 _pathsBeforeSave.Clear();
                 _pathsBeforeClose.Clear();
+                _bufferPaths.Clear();
 
                 try { _stateStore?.Dispose(); }
                 catch (Exception ex) { CrashLog.Write("OnNppShutdown: state dispose failed - " + ex.Message); }
@@ -910,6 +915,12 @@ namespace VirtualTabGroups.Plugin
                 foreach (var bufferId in bufferIds)
                 {
                     var name = GetPathForBufferId(bufferId);
+
+                    // Startup is the first chance to learn where every restored buffer
+                    // lives: a save later in the session relies on this when the
+                    // pre-save notification is missed.
+                    _bufferPaths.Remember(bufferId.ToInt64(), name);
+
                     if (string.IsNullOrEmpty(name) || System.IO.Path.IsPathRooted(name)) continue;
 
                     // A restored session can hold two buffers under the same placeholder
@@ -1197,6 +1208,14 @@ namespace VirtualTabGroups.Plugin
             new Dictionary<IntPtr, string>();
 
         /// <summary>
+        /// Last known path of every buffer, refreshed on open, on activation and by the
+        /// startup sweep. NPPN_FILESAVED reports only the new path, so a relink needs the
+        /// old one; when NPPN_FILEBEFORESAVE is missed or arrives late this map still
+        /// knows where the buffer used to live.
+        /// </summary>
+        private static readonly Core.BufferPathMap _bufferPaths = new Core.BufferPathMap();
+
+        /// <summary>
         /// Paths captured at NPPN_FILEBEFORECLOSE, keyed by buffer ID. FILECLOSED no
         /// longer resolves the buffer, so a discarded document's key is only readable
         /// while it is still open.
@@ -1225,9 +1244,22 @@ namespace VirtualTabGroups.Plugin
                 var currentPath = GetPathForBufferId(bufferId);
                 if (string.IsNullOrEmpty(currentPath) || !File.Exists(currentPath)) return;
 
-                string previousPath = null;
-                bool hadPrevious = _pathsBeforeSave.TryGetValue(bufferId, out previousPath);
-                if (hadPrevious) _pathsBeforeSave.Remove(bufferId);
+                string capturedPath = null;
+                bool hadCaptured = _pathsBeforeSave.TryGetValue(bufferId, out capturedPath);
+                if (hadCaptured) _pathsBeforeSave.Remove(bufferId);
+
+                // FILESAVED carries only the new path. When the pre-save capture did not
+                // arrive, the remembered path still says where this buffer used to live,
+                // so the entry can be moved instead of being left behind. TakePrevious
+                // also refreshes the map to the new path for the next save.
+                var rememberedPath = _bufferPaths.TakePrevious(bufferId.ToInt64(), currentPath);
+                string previousPath = hadCaptured ? capturedPath : rememberedPath;
+
+                // Which anchor supplied the old path: the pre-save notification or the
+                // buffer map that covers a missed one.
+                CrashLog.Write("OnFileSavedOrRenamed: previous path '" + previousPath
+                    + "' from " + (hadCaptured ? "pre-save capture"
+                        : rememberedPath != null ? "buffer map" : "no source"));
 
                 // The buffer carries a new path now, so a later close must not clear the
                 // indicator of the path it used to have.
@@ -1237,9 +1269,10 @@ namespace VirtualTabGroups.Plugin
                     GetAllOpenFilePaths() ?? Array.Empty<string>(),
                     StringComparer.OrdinalIgnoreCase);
 
-                // Exact relink first: the captured pre-save path identifies the entry
-                // even when the buffer had no path yet or the old file still exists,
-                // which is precisely when the on-disk heuristic below gives up.
+                // Exact relink first: the pre-save path (captured or remembered)
+                // identifies the entry even when the buffer had no path yet or the old
+                // file still exists, which is precisely when the on-disk heuristic
+                // below gives up.
                 bool changed = RelinkEntry(previousPath, currentPath);
                 if (!changed) changed = SyncNodePaths(_root, openPaths);
 
@@ -1253,7 +1286,7 @@ namespace VirtualTabGroups.Plugin
                 // The saved buffer is clean even when no history path needed syncing.
                 // Keep this outside the changed block so ordinary Ctrl+S also clears
                 // the indicator. A key for the old path/name must not linger either.
-                if (hadPrevious && !SamePath(previousPath, currentPath))
+                if (!string.IsNullOrEmpty(previousPath) && !SamePath(previousPath, currentPath))
                     _dirtyTracker.SetDirty(previousPath, false);
                 _dirtyTracker.SetDirty(currentPath, false);
 
@@ -1285,6 +1318,25 @@ namespace VirtualTabGroups.Plugin
             }
         }
 
+        /// <summary>
+        /// Keeps the map in step with the buffer's current path. Called on open, on
+        /// activation and by the startup sweep, so a later save still has an old path
+        /// to compare against even if NPPN_FILEBEFORESAVE never arrives.
+        /// </summary>
+        private static void RememberBufferPath(IntPtr bufferId)
+        {
+            if (bufferId == IntPtr.Zero) return;
+
+            try
+            {
+                _bufferPaths.Remember(bufferId.ToInt64(), GetPathForBufferId(bufferId));
+            }
+            catch (Exception ex)
+            {
+                CrashLog.WriteException("RememberBufferPath", ex);
+            }
+        }
+
         private static void RememberPathBeforeClose(IntPtr bufferId)
         {
             if (bufferId == IntPtr.Zero) return;
@@ -1313,7 +1365,10 @@ namespace VirtualTabGroups.Plugin
 
             // The buffer is gone; nothing may stay keyed on it, and a pre-save path
             // left by a cancelled Save As would relink an unrelated entry later.
+            // Notepad++ reuses buffer IDs, so a stale remembered path would be just as
+            // dangerous.
             _pathsBeforeSave.Remove(bufferId);
+            _bufferPaths.Forget(bufferId.ToInt64());
 
             string path;
             if (!_pathsBeforeClose.TryGetValue(bufferId, out path)) return;
