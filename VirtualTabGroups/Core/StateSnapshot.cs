@@ -44,8 +44,12 @@ namespace VirtualTabGroups.Core
                 string created = null;
                 if (existing.Count == 0 || !SameBytes(existing[0], current))
                 {
+                    // The random suffix keeps two starts in the same millisecond from
+                    // overwriting each other; the timestamp still decides the order.
                     created = Path.Combine(directory,
-                        prefix + DateTime.Now.ToString("yyyyMMdd-HHmmss-fff") + ".json");
+                        prefix + DateTime.Now.ToString("yyyyMMdd-HHmmss-fff")
+                        + "-" + Path.GetRandomFileName().Replace(".", string.Empty).Substring(0, 4)
+                        + ".json");
                     File.WriteAllBytes(created, current);
                     existing.Insert(0, created);
                 }

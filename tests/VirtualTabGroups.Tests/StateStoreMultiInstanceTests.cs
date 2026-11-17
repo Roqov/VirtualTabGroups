@@ -87,6 +87,35 @@ namespace VirtualTabGroups.Tests
         }
 
         [Fact]
+        public void Save_ManyForeignWrites_KeepsTheCopiesBounded()
+        {
+            var path = NewTempStatePath();
+            var observer = new CapturingObserver();
+
+            using (var store = new StateStore(path, observer, TimeSpan.FromSeconds(10)))
+            {
+                store.Load();
+                for (int i = 0; i < 8; i++)
+                {
+                    store.MarkDirty(new FolderNode(""), null);
+                    store.Flush();
+
+                    // The other window saves a different tree after every one of ours.
+                    File.WriteAllText(path,
+                        "{\"schemaVersion\":1,\"marker\":\"other-" + i + "\",\"root\":{\"type\":\"folder\"," +
+                        "\"id\":\"11111111-1111-1111-1111-111111111111\",\"name\":\"\",\"children\":[]}}");
+                }
+
+                store.MarkDirty(new FolderNode(""), null);
+                store.Flush();
+            }
+
+            var copies = Directory.GetFiles(Path.GetDirectoryName(path), "state.json.foreign-*");
+            Assert.NotEmpty(copies);
+            Assert.True(copies.Length <= 5, "expected at most five foreign copies, found " + copies.Length);
+        }
+
+        [Fact]
         public void Save_UsesUniqueTempFilesAndLeavesNoneBehind()
         {
             var path = NewTempStatePath();

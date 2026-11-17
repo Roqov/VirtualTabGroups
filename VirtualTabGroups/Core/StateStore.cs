@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
@@ -105,7 +106,13 @@ namespace VirtualTabGroups.Core
         // Signature (length + last write time) of the file as this session last saw it.
         // A different signature before a write means somebody else — normally a second
         // Notepad++ instance sharing the config folder — wrote the file in between.
-        private string _knownStamp;
+        // Written by the UI thread on load and by the debounce timer on save, so it is
+        // volatile: a stale read would silently skip the conflict check.
+        private volatile string _knownStamp;
+
+        // Two windows alternating saves would otherwise drop a copy per save; the last
+        // few foreign versions are enough to recover from a mistake.
+        private const int KeepForeignCopies = 5;
 
         public void MarkDirty(FolderNode root, Guid? selectedId = null)
         {
@@ -234,12 +241,34 @@ namespace VirtualTabGroups.Core
             try
             {
                 File.Copy(_stateFilePath, target, overwrite: false);
+                PruneForeignCopies(directory, Path.GetFileName(_stateFilePath));
                 return target;
             }
             catch (Exception)
             {
                 // The copy is a courtesy; never let it stop this session from saving.
                 return null;
+            }
+        }
+
+        private static void PruneForeignCopies(string directory, string stateFileName)
+        {
+            try
+            {
+                var prefix = stateFileName + ".foreign-";
+                var copies = Directory.GetFiles(directory, prefix + "*.json")
+                    .OrderByDescending(path => path, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                for (int i = KeepForeignCopies; i < copies.Count; i++)
+                {
+                    try { File.Delete(copies[i]); }
+                    catch (Exception) { /* one locked copy must not stop the rest */ }
+                }
+            }
+            catch (Exception)
+            {
+                // Pruning is housekeeping, never a reason to fail a save.
             }
         }
 

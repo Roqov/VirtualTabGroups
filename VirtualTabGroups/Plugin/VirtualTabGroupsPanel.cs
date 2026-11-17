@@ -1555,6 +1555,16 @@ namespace VirtualTabGroups.Plugin
                     return;
                 }
 
+                // A deleted entry for an open document comes back on its own when the
+                // tab is activated again; restoring it a second time would leave two
+                // rows for one file.
+                if (record.Node is FileNode fileNode
+                    && TreeQuery.FindFileByPath(_root, fileNode.Path) != null)
+                {
+                    ShowTransientStatus("Already back: " + fileNode.Name + " was re-added.");
+                    return;
+                }
+
                 if (!TreeMutator.InsertNode(_root, record.ParentId, record.Index, record.Node))
                 {
                     ShowTransientStatus("Cannot restore " + record.Node.Name + " — its group is gone.");
