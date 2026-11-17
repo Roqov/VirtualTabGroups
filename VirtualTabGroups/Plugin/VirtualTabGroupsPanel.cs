@@ -39,7 +39,15 @@ namespace VirtualTabGroups.Plugin
         private const int LongPressThresholdMs = 650;
         private TreeNode _pressNode;
         private Point _pressStart;
-        private DateTime _pressAt;
+        // Threshold and cancellation rules live in Core so they can be tested
+        // without a real mouse; the panel only maps a result to an action.
+        private readonly PressGesture _pressGesture = new PressGesture(LongPressThresholdMs);
+        // Set when a right click cancelled a long press: that click must not also
+        // open the context menu, or cancelling would look like a second command.
+        private bool _suppressContextMenuOnce;
+
+        // Session-only undo for removals (Delete, long press, menu).
+        private readonly EditHistory _editHistory = new EditHistory();
         // Row currently showing the close badge. Set only once the long-press
         // threshold has actually elapsed, so an ordinary click never flashes it.
         private TreeNode _closeArmedNode;
@@ -259,7 +267,8 @@ namespace VirtualTabGroups.Plugin
             _pressHintTimer.Tick += (s, e) =>
             {
                 _pressHintTimer.Stop();
-                if (_pressNode?.Tag is FileNode hinted)
+                if (_pressNode == null || !_pressGesture.IsPressed) return;
+                if (_pressNode.Tag is FileNode hinted)
                 {
                     _statusLabel.Text = "Release to close: " + hinted.Name;
                     SetCloseArmedNode(_pressNode);
@@ -294,6 +303,7 @@ namespace VirtualTabGroups.Plugin
                     // swallowed by the OLE drag loop, so clear pending press/click
                     // state here — otherwise it would leak into the next real click.
                     _pressNode = null;
+                    _pressGesture.Cancel();
                     _pendingClickNode = null;
                     _doubleClickTimer.Stop();
 
@@ -740,6 +750,13 @@ namespace VirtualTabGroups.Plugin
         {
             try
             {
+                if (_suppressContextMenuOnce)
+                {
+                    _suppressContextMenuOnce = false;
+                    e.Cancel = true;
+                    return;
+                }
+
                 _menu.Items.Clear();
 
                 var hit = _tree.HitTest(_tree.PointToClient(Cursor.Position));
@@ -793,6 +810,16 @@ namespace VirtualTabGroups.Plugin
                             (s, ev) => SwapWorkspaceToFolder(existingFolder)));
                     }
                 }
+
+                // Removing an entry is deliberate but easy to trigger by accident
+                // (Delete, long press), so every menu offers the way back.
+                _menu.Items.Add(new ToolStripSeparator());
+                _menu.Items.Add(new ToolStripMenuItem("Undo remove", null, (s, ev) => OnUndoRemove())
+                {
+                    Enabled = _editHistory.Count > 0,
+                    ShortcutKeyDisplayString = "Ctrl+Z",
+                });
+                _menu.Items.Add(new ToolStripMenuItem("Copy diagnostics", null, (s, ev) => OnCopyDiagnostics()));
             }
             catch (Exception ex)
             {
@@ -885,13 +912,27 @@ namespace VirtualTabGroups.Plugin
 
         private void Tree_MouseDownLongPress(object sender, MouseEventArgs e)
         {
+            // Right click while the left button is still held abandons the pending
+            // long-press action: nothing is closed or removed and the context menu
+            // that this click would normally open stays shut.
+            if (e.Button == MouseButtons.Right && _pressNode != null)
+            {
+                _pressNode = null;
+                _pressGesture.Cancel();
+                _pressHintTimer.Stop();
+                SetCloseArmedNode(null);
+                _suppressContextMenuOnce = true;
+                ShowTransientStatus("Cancelled — nothing was closed or removed.");
+                return;
+            }
+
             if (e.Button != MouseButtons.Left) return;
             var hit = _tree.HitTest(e.Location);
-            if (hit.Node == null) { _pressNode = null; return; }
+            if (hit.Node == null) { _pressNode = null; _pressGesture.Cancel(); return; }
 
             _pressNode = hit.Node;
             _pressStart = e.Location;
-            _pressAt = DateTime.UtcNow;
+            _pressGesture.Press(DateTime.UtcNow);
             SetCloseArmedNode(null);
 
             // Hint only: the action still runs on release, so a press that turns
@@ -926,6 +967,7 @@ namespace VirtualTabGroups.Plugin
                 || Math.Abs(e.Y - _pressStart.Y) > dragSize.Height)
             {
                 _pressNode = null;
+                _pressGesture.Cancel();
                 _pressHintTimer.Stop();
                 SetCloseArmedNode(null);
             }
@@ -942,8 +984,8 @@ namespace VirtualTabGroups.Plugin
             // Long press: button held on one spot for the threshold, evaluated on
             // release. A real drag never reaches this branch — the OLE drag loop
             // swallows MouseUp, and ItemDrag/MouseMove already cleared _pressNode.
-            if (pressNode != null
-                && (DateTime.UtcNow - _pressAt).TotalMilliseconds >= LongPressThresholdMs)
+            var release = _pressGesture.Release(DateTime.UtcNow);
+            if (pressNode != null && release == PressRelease.LongPress)
             {
                 _doubleClickTimer.Stop();
                 _pendingClickNode = null;
@@ -1471,7 +1513,10 @@ namespace VirtualTabGroups.Plugin
                     if (result != DialogResult.OK) return;
                 }
 
+                var parent = TreeMutator.FindContainer(_root, target);
+                int index = parent != null ? parent.Children.IndexOf(target) : -1;
                 if (!TreeMutator.RemoveNode(target, _root)) return;
+                if (parent != null && index >= 0) _editHistory.RecordRemoval(target, parent, index);
 
                 var tn = FindByModelId(_tree.Nodes, target.Id);
                 if (tn != null)
@@ -1491,6 +1536,76 @@ namespace VirtualTabGroups.Plugin
                 ReportError("Remove", ex);
             }
         }
+
+        /// <summary>
+        /// Puts the most recently removed entry back where it was. The node instance is
+        /// the same one that left the tree, so its label, pin state and identity survive;
+        /// a folder returns with everything it contained.
+        /// </summary>
+        private void OnUndoRemove()
+        {
+            try
+            {
+                if (_root == null) return;
+
+                var record = _editHistory.TakeLast();
+                if (record == null)
+                {
+                    ShowTransientStatus("Nothing to undo.");
+                    return;
+                }
+
+                if (!TreeMutator.InsertNode(_root, record.ParentId, record.Index, record.Node))
+                {
+                    ShowTransientStatus("Cannot restore " + record.Node.Name + " — its group is gone.");
+                    return;
+                }
+
+                _stateStore?.MarkDirty(_root, _currentSelectedId);
+                RefreshFromModel();
+
+                var restored = FindByModelId(_tree.Nodes, record.Node.Id);
+                if (restored != null)
+                {
+                    _tree.SelectedNode = restored;
+                    restored.EnsureVisible();
+                }
+                UpdateChrome();
+                ShowTransientStatus("Restored: " + record.Node.Name);
+            }
+            catch (Exception ex) { ReportError("Undo remove", ex); }
+        }
+
+        /// <summary>
+        /// Copies a short support bundle to the clipboard: versions, tree size, file
+        /// locations and the log tail. The log is the only diagnostic channel the
+        /// plugin has, and asking a user to find a hidden AppData folder is the usual
+        /// reason a report arrives without it.
+        /// </summary>
+        private void OnCopyDiagnostics()
+        {
+            try
+            {
+                int files = 0, folders = 0;
+                CountNodes(_root, ref files, ref folders);
+
+                var text = new System.Text.StringBuilder();
+                text.AppendLine("Virtual Tab Groups diagnostics");
+                text.AppendLine("plugin: " + typeof(VirtualTabGroupsPanel).Assembly.GetName().Version);
+                text.AppendLine("os: " + Environment.OSVersion.VersionString);
+                text.AppendLine("tree: " + files + " file(s), " + folders + " group(s)");
+                text.AppendLine("state file: " + PluginMain.StateFilePath);
+                text.AppendLine("log: " + CrashLog.LogPath);
+                text.AppendLine();
+                text.Append(CrashLogTail());
+
+                Clipboard.SetText(text.ToString());
+                ShowTransientStatus("Diagnostics copied");
+            }
+            catch (Exception ex) { ReportError("Copy diagnostics", ex); }
+        }
+
+        private static string CrashLogTail() => CrashLog.Tail(40);
 
         /// <summary>
         /// Deletes every selected entry with a single confirmation, so a multi-select
@@ -1530,7 +1645,10 @@ namespace VirtualTabGroups.Plugin
                 int removed = 0;
                 foreach (var model in models)
                 {
+                    var parent = TreeMutator.FindContainer(_root, model);
+                    int index = parent != null ? parent.Children.IndexOf(model) : -1;
                     if (!TreeMutator.RemoveNode(model, _root)) continue;
+                    if (parent != null && index >= 0) _editHistory.RecordRemoval(model, parent, index);
                     var tn = FindByModelId(_tree.Nodes, model.Id);
                     if (tn != null) tn.Remove();
                     if (_currentSelectedId == model.Id) _currentSelectedId = null;
@@ -1574,6 +1692,13 @@ namespace VirtualTabGroups.Plugin
                 if (e.KeyCode == Keys.F2 && selected != null)
                 {
                     RenameDisplayNode(selected);
+                    e.Handled = true;
+                    return;
+                }
+
+                if (e.Control && !e.Shift && !e.Alt && e.KeyCode == Keys.Z)
+                {
+                    OnUndoRemove();
                     e.Handled = true;
                     return;
                 }

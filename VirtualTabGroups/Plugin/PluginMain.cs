@@ -58,6 +58,10 @@ namespace VirtualTabGroups.Plugin
         private static Action _showPanelDelegate;
         private static Action _aboutDelegate;
 
+        /// <summary>Where the tree is persisted; shown by the diagnostics command.</summary>
+        internal static string StateFilePath => _stateFilePath;
+        private static string _stateFilePath;
+
         // 16x16 icon for the docked-panel tab. Stored statically so the HICON it
         // exposes stays valid for the plugin's lifetime — Notepad++ keeps a reference
         // to the HICON after RegisterAsDockedPanel returns.
@@ -96,9 +100,9 @@ namespace VirtualTabGroups.Plugin
                 CrashLog.Initialize(pluginConfigDir);
                 CrashLog.Write("setInfo: configDir=" + pluginConfigDir);
 
-                var stateFilePath = Path.Combine(pluginConfigDir, "state.json");
+                _stateFilePath = Path.Combine(pluginConfigDir, "state.json");
                 _observer = new NotepadPlusPlusObserver(new WindowsMessageBoxProxy());
-                _stateStore = new StateStore(stateFilePath, _observer);
+                _stateStore = new StateStore(_stateFilePath, _observer);
             }
             catch (Exception ex)
             {
@@ -754,6 +758,7 @@ namespace VirtualTabGroups.Plugin
         internal static bool TryRenameSavedFile(string path, ThemeManager theme, out string renamedPath)
         {
             renamedPath = null;
+            bool caseOnly = false;
             if (string.IsNullOrEmpty(path) || !System.IO.Path.IsPathRooted(path)
                 || !File.Exists(path))
                 return false;
@@ -781,7 +786,12 @@ namespace VirtualTabGroups.Plugin
                 }
 
                 renamedPath = Path.Combine(directory, newName);
-                if (File.Exists(renamedPath))
+
+                // A case-only rename (notes.txt -> Notes.txt) is the same file on
+                // Windows: the existence check would reject it, and File.Move needs a
+                // staging name to change the casing reliably.
+                caseOnly = string.Equals(renamedPath, path, StringComparison.OrdinalIgnoreCase);
+                if (!caseOnly && File.Exists(renamedPath))
                 {
                     System.Windows.Forms.MessageBox.Show(
                         "A file with that name already exists in this folder.",
@@ -802,7 +812,8 @@ namespace VirtualTabGroups.Plugin
 
             try
             {
-                File.Move(path, renamedPath);
+                MoveFile(path, renamedPath, caseOnly);
+
                 if (wasOpen)
                 {
                     // Reopening raises NPPN_FILEOPENED; the caller relinks the
@@ -810,6 +821,27 @@ namespace VirtualTabGroups.Plugin
                     SuppressAutoTrack = true;
                     try { OpenFileUnchecked(renamedPath); }
                     finally { SuppressAutoTrack = false; }
+
+                    // The file must be back as a tab under its new name. If the host
+                    // refused to reopen it, the tab is gone and the tree still points
+                    // at the old path — roll the rename back instead of leaving that
+                    // half-done state behind.
+                    if (!IsPathOpen(renamedPath))
+                    {
+                        CrashLog.Write("TryRenameSavedFile: reopen failed for '" + renamedPath
+                            + "', rolling the rename back");
+                        try
+                        {
+                            MoveFile(renamedPath, path, caseOnly);
+                            OpenFileUnchecked(path);
+                        }
+                        catch (Exception rollback)
+                        {
+                            CrashLog.WriteException("TryRenameSavedFile rollback", rollback);
+                        }
+                        renamedPath = null;
+                        return false;
+                    }
                 }
                 return true;
             }
@@ -823,6 +855,33 @@ namespace VirtualTabGroups.Plugin
                     System.Windows.Forms.MessageBoxIcon.Error);
                 renamedPath = null;
                 return false;
+            }
+        }
+
+        /// <summary>
+        /// Moves a file, using a staging name when only the casing changes: Windows
+        /// treats the source and destination as the same file, so a direct move is not
+        /// reliable. A failed second step restores the original name.
+        /// </summary>
+        private static void MoveFile(string from, string to, bool caseOnly)
+        {
+            if (!caseOnly)
+            {
+                File.Move(from, to);
+                return;
+            }
+
+            var staging = from + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            File.Move(from, staging);
+            try
+            {
+                File.Move(staging, to);
+            }
+            catch
+            {
+                try { File.Move(staging, from); }
+                catch (Exception restore) { CrashLog.WriteException("MoveFile restore", restore); }
+                throw;
             }
         }
 
@@ -1253,13 +1312,15 @@ namespace VirtualTabGroups.Plugin
                 // so the entry can be moved instead of being left behind. TakePrevious
                 // also refreshes the map to the new path for the next save.
                 var rememberedPath = _bufferPaths.TakePrevious(bufferId.ToInt64(), currentPath);
-                string previousPath = hadCaptured ? capturedPath : rememberedPath;
 
-                // Which anchor supplied the old path: the pre-save notification or the
-                // buffer map that covers a missed one.
+                // Precedence and the "nothing to relink" rule live in Core so they can
+                // be tested without a running Notepad++.
+                var decision = Core.RelinkDecision.Decide(
+                    hadCaptured ? capturedPath : null, rememberedPath, currentPath);
+                string previousPath = decision.PreviousPath;
+
                 CrashLog.Write("OnFileSavedOrRenamed: previous path '" + previousPath
-                    + "' from " + (hadCaptured ? "pre-save capture"
-                        : rememberedPath != null ? "buffer map" : "no source"));
+                    + "' from " + decision.AnchorLabel);
 
                 // The buffer carries a new path now, so a later close must not clear the
                 // indicator of the path it used to have.
@@ -1273,7 +1334,7 @@ namespace VirtualTabGroups.Plugin
                 // identifies the entry even when the buffer had no path yet or the old
                 // file still exists, which is precisely when the on-disk heuristic
                 // below gives up.
-                bool changed = RelinkEntry(previousPath, currentPath);
+                bool changed = decision.CanRelink && RelinkEntry(previousPath, currentPath);
                 if (!changed) changed = SyncNodePaths(_root, openPaths);
 
                 if (changed)

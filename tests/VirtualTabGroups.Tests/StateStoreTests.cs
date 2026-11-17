@@ -92,6 +92,7 @@ namespace VirtualTabGroups.Tests
                 CurrentSchemaSeen = currentVersion;
             }
             public void OnSaveFailed(System.Exception ex) => SaveError = ex;
+            public void OnForeignStateDetected(string backupPath) { }
         }
 
         [Fact]
@@ -269,6 +270,7 @@ namespace VirtualTabGroups.Tests
             public void OnRecoveredFromCorruptFile(string backupPath) => throw new System.InvalidOperationException("boom");
             public void OnFutureSchemaVersion(int versionFound, int currentVersion) => throw new System.InvalidOperationException("boom");
             public void OnSaveFailed(System.Exception ex) => throw new System.InvalidOperationException("boom");
+            public void OnForeignStateDetected(string backupPath) => throw new System.InvalidOperationException("boom");
         }
 
         [Fact]

@@ -79,6 +79,11 @@ namespace VirtualTabGroups.Core
                 {
                     throw new JsonException("state.json root must be a folder node, not a file.");
                 }
+
+                // The file parsed, so a copy is worth keeping before this session can
+                // overwrite it; a tree damaged later in the session is otherwise gone.
+                _knownStamp = StampOf(_stateFilePath);
+                StateSnapshot.Take(_stateFilePath);
                 return folder;
             }
             catch (Exception)
@@ -96,6 +101,11 @@ namespace VirtualTabGroups.Core
 
         private string _pendingJson;
         private readonly object _writeLock = new object();
+
+        // Signature (length + last write time) of the file as this session last saw it.
+        // A different signature before a write means somebody else — normally a second
+        // Notepad++ instance sharing the config folder — wrote the file in between.
+        private string _knownStamp;
 
         public void MarkDirty(FolderNode root, Guid? selectedId = null)
         {
@@ -134,9 +144,26 @@ namespace VirtualTabGroups.Core
                 // Do NOT clear _pendingJson yet — only clear on successful write.
             }
 
+            // The temp file name must be unique per attempt: a second instance writing
+            // "state.json.tmp" at the same moment would make File.Replace fail or
+            // replace our own data with the other window's.
+            var tmpPath = _stateFilePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
             try
             {
-                var tmpPath = _stateFilePath + ".tmp";
+                // A changed signature means another process owns the current file. Keep
+                // its bytes next to ours instead of overwriting them silently; the user
+                // is told where they went.
+                var diskStamp = StampOf(_stateFilePath);
+                if (_knownStamp != null && diskStamp != null && diskStamp != _knownStamp)
+                {
+                    var foreignCopy = CopyForeignStateFile();
+                    if (foreignCopy != null)
+                    {
+                        try { _observer?.OnForeignStateDetected(foreignCopy); }
+                        catch { /* swallow observer exceptions — timer thread */ }
+                    }
+                }
+
                 File.WriteAllText(tmpPath, json, new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
 
                 if (File.Exists(_stateFilePath))
@@ -147,6 +174,8 @@ namespace VirtualTabGroups.Core
                 {
                     File.Move(tmpPath, _stateFilePath);
                 }
+
+                _knownStamp = StampOf(_stateFilePath);
 
                 lock (_writeLock)
                 {
@@ -160,9 +189,59 @@ namespace VirtualTabGroups.Core
                 catch { /* swallow observer exceptions — never let host code crash the timer thread. */ }
                 // Leave _pendingJson set so the next MarkDirty or Flush retries.
             }
+            finally
+            {
+                try
+                {
+                    if (File.Exists(tmpPath)) File.Delete(tmpPath);
+                }
+                catch { /* a stale temp file is harmless; the next write uses a new name */ }
+            }
         }
 
         private void OnDebounceFired() => WritePendingNow();
+
+        /// <summary>
+        /// Length plus last write time is enough to notice a foreign write without
+        /// rehashing the whole file on every save.
+        /// </summary>
+        private static string StampOf(string path)
+        {
+            try
+            {
+                var info = new FileInfo(path);
+                return info.Exists
+                    ? info.Length.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                        + ":" + info.LastWriteTimeUtc.Ticks.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                    : null;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        private string CopyForeignStateFile()
+        {
+            var directory = Path.GetDirectoryName(_stateFilePath);
+            if (string.IsNullOrEmpty(directory)) return null;
+
+            var name = Path.GetFileName(_stateFilePath) + ".foreign-"
+                + DateTime.Now.ToString("yyyyMMdd-HHmmss-fff") + "-"
+                + Path.GetRandomFileName().Replace(".", string.Empty) + ".json";
+            var target = Path.Combine(directory, name);
+
+            try
+            {
+                File.Copy(_stateFilePath, target, overwrite: false);
+                return target;
+            }
+            catch (Exception)
+            {
+                // The copy is a courtesy; never let it stop this session from saving.
+                return null;
+            }
+        }
 
         public void Flush()
         {

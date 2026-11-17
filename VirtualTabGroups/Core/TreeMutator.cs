@@ -42,6 +42,48 @@ namespace VirtualTabGroups.Core
         }
 
         /// <summary>
+        /// Puts a previously removed node back into the folder identified by
+        /// <paramref name="parentId"/>, at the position it used to occupy. Used by the
+        /// undo of a removal; the caller owns the same node instance and its display
+        /// name, so no alias is re-resolved. Returns false when the folder is gone
+        /// (it was removed itself) or the node is already back in the tree.
+        /// </summary>
+        public static bool InsertNode(FolderNode root, Guid parentId, int index, TreeNodeModel node)
+        {
+            if (root == null || node == null) return false;
+            if (IsInTree(root, node)) return false;
+
+            var parent = FindById(root, parentId);
+            if (parent == null) return false;
+
+            index = Math.Max(0, Math.Min(index, parent.Children.Count));
+            parent.Children.Insert(index, node);
+            return true;
+        }
+
+        /// <summary>Finds a folder by id anywhere in the tree, or null.</summary>
+        public static FolderNode FindById(FolderNode root, Guid id)
+        {
+            if (root == null) return null;
+            if (root.Id == id) return root;
+
+            foreach (var child in root.Children)
+            {
+                if (child is FolderNode subFolder)
+                {
+                    var found = FindById(subFolder, id);
+                    if (found != null) return found;
+                }
+            }
+            return null;
+        }
+
+        private static bool IsInTree(FolderNode root, TreeNodeModel node)
+        {
+            return root.Children.Contains(node) || FindContainer(root, node) != null;
+        }
+
+        /// <summary>
         /// Walks the tree from root, returning the folder that directly contains the target node, or null if not found.
         /// </summary>
         public static FolderNode FindContainer(FolderNode root, TreeNodeModel target)

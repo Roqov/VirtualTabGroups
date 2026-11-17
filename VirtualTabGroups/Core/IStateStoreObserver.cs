@@ -32,5 +32,14 @@ namespace VirtualTabGroups.Core
         /// the next MarkDirty or Flush will retry. Implementations must not throw.
         /// </summary>
         void OnSaveFailed(Exception ex);
+
+        /// <summary>
+        /// Called before this session overwrites a state file that changed on disk since
+        /// it was last read or written — the signature of a second Notepad++ instance
+        /// using the same config folder. The foreign version has already been copied to
+        /// <paramref name="backupPath"/>, so no write is lost silently. Implementations
+        /// must not throw.
+        /// </summary>
+        void OnForeignStateDetected(string backupPath);
     }
 }
