@@ -1275,6 +1275,9 @@ namespace VirtualTabGroups.Plugin
                 var path = GetPathForBufferId(bufferId);
                 if (string.IsNullOrEmpty(path)) _pathsBeforeSave.Remove(bufferId);
                 else _pathsBeforeSave[bufferId] = path;
+
+                // Logged so a relink can be traced back to the path it started from.
+                CrashLog.Write("RememberPathBeforeSave: '" + path + "'");
             }
             catch (Exception ex)
             {
