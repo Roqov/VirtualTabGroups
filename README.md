@@ -43,10 +43,11 @@ The panel is **purely virtual**. It does not scan your disk, mirror folders, or 
 - **New Folder** — toolbar button, `Ctrl+N`, or context menu; creates an empty group with immediate in-place rename.
 - **Rename** — `F2` or context menu, edits the *display label* only; the actual file on disk is never renamed.
 - **Remove** — removes the entry from the panel; **does not delete the file on disk**. A saved, unmodified file is removed without a dialog (it still exists on disk); unsaved buffers, files with unsaved changes and non-empty folders ask first. `Delete` removes the whole multi-selection behind one confirmation.
+- **Undo a removal** — `Ctrl+Z` or right-click → *Undo remove* puts the last removed entry back where it was, with its subtree, label and pin state intact. The history lives for the current session only, and undo does not duplicate a row whose document already re-added itself.
 - **Open / activate** — single-click a file to switch to its tab in Notepad++. If the file isn't currently open, it's reopened from disk. If it was an unsaved scratch buffer that's since been closed, you get a friendly "buffer no longer open" message instead of trying to create a file at a path that doesn't exist.
 - **Double-click rename** — double-click a saved file to rename the real file on disk after an explicit warning dialog; double-click an unsaved buffer to open Notepad++'s native Save As flow.
 - **Entries follow saving and renaming.** Save an unsaved buffer, use *Save As*, or rename a file — the panel entry takes the new name and path immediately instead of keeping the old label. Display aliases (`User(1).php`) are recalculated on the way, so same-named files stay unambiguous.
-- **Long press close and remove** — long-press a file to invoke Notepad++'s native close flow (including the save/discard/cancel prompt), then remove the entry only after the close succeeds.
+- **Long press close and remove** — long-press a file to invoke Notepad++'s native close flow (including the save/discard/cancel prompt), then remove the entry only after the close succeeds. Press the **right** mouse button while the left is still held to cancel the gesture: nothing closes, nothing is removed, and the context menu that click would open is suppressed.
 - **Groups are just groups** — clicking a folder selects it; the panel always shows the whole tree. Double-clicking a folder expands or collapses it. Replacing every open tab with a folder's files is an explicit, confirmed command (*Replace workspace with folder files…*).
 - **Reveal in Explorer** — right-click a file → opens Windows Explorer at the file's parent folder with the file highlighted. Disabled for unsaved buffers (nothing to reveal).
 - **Copy full path** — right-click a file → puts the file's absolute path on the clipboard. Disabled for unsaved buffers.
@@ -60,6 +61,8 @@ The panel is **purely virtual**. It does not scan your disk, mirror folders, or 
 - **Persistent file history.** Closing a file via Notepad++'s tab `X` keeps it in its virtual folder. Saved files can be reopened later by a single click; unsaved buffers remain as history entries and show a clear message if the original buffer no longer exists. Closing a tab never silently changes the user's virtual organization.
 - **Unsaved buffers can persist across sessions.** Add `new 17` or any other unsaved scratch buffer to a folder — useful for organizing work-in-progress alongside saved files. If Notepad++'s session backup is enabled (*Settings → Preferences → Backup → "Remember current session for next launch"*), the buffer comes back on relaunch with the same name and your virtual entry stays valid. With session backup off, the buffer may be unavailable after shutdown, but the history entry remains visible and explains why it cannot be reopened.
 - **Duplicate cleanup on launch.** If the state ever holds two entries for the same path (older builds could add one when a rename reopened the file), the panel lists them at startup and asks before removing the extra rows. Answering *No* keeps the tree exactly as it is, and no file on disk is touched either way.
+- **Startup snapshots.** Every launch copies a valid state file to `state.json.bak-yyyyMMdd-HHmmss-fff-<random>` before the session can overwrite it. The newest five are kept, identical content is not duplicated, and the files are plain JSON you can copy back over `state.json` if a session damages the tree.
+- **Two Notepad++ windows at once.** Both windows share the same state file, so the plugin watches it: if the file changed underneath a session, the other window's version is copied to `state.json.foreign-yyyyMMdd-HHmmss-fff-<random>` (newest five kept) and a single dialog explains it, instead of that tree vanishing silently.
 - **Corrupt-state recovery.** If something hand-edits or corrupts the state file, the plugin backs it up to `state.json.corrupt-yyyyMMdd-HHmmssZ-<random>` and starts with a clean tree rather than crashing. A dialog tells you where the backup landed.
 - **Future-version safety.** If a future version of the plugin writes a newer schema, an older plugin reading that file enters read-only mode for the session rather than overwriting newer data.
 
@@ -74,7 +77,8 @@ The panel is **purely virtual**. It does not scan your disk, mirror folders, or 
 
 ### Stability
 - **No-crash crash guards.** Every UI callback (menu actions, drag handlers, paint cycles, timer ticks, plugin entry points) is wrapped in exception isolation. A bug in plugin code surfaces as a MessageBox you can read, not a host-process crash that loses your work.
-- **File-based crash log.** `plugin.log` in the plugin config directory records every notable event — initialization, lifecycle hooks, exceptions with stack traces, and breadcrumbs through user actions. If something does go wrong, the log usually pinpoints the failure in one read.
+- **File-based crash log.** `plugin.log` in the plugin config directory records every notable event — initialization, lifecycle hooks, exceptions with stack traces, and breadcrumbs through user actions. If something does go wrong, the log usually pinpoints the failure in one read. Each session header records the plugin version and OS, and the file is capped at 1 MB with one rotation to `plugin.log.1`.
+- **Copy diagnostics.** Right-click in the panel → *Copy diagnostics* puts the plugin version, OS, tree size, state-file and log paths and the last 40 log lines on the clipboard, ready to paste into an issue.
 - **Save-failure deduplication.** If a disk-write fails, you get one informative dialog — not one per debounced save while the issue persists.
 
 ---
@@ -126,11 +130,13 @@ Drag files or folders between folders. Multi-select with `Ctrl+click` to pick se
 
 `Delete` or right-click → *Remove* to take an entry out of the panel. Files on disk are never deleted — *Remove* only affects the virtual entry. Removing a saved, unmodified file is instant; unsaved buffers, files with unsaved changes and non-empty folders require confirmation. With a multi-selection, `Delete` removes everything selected behind a single dialog.
 
+If a removal was a mistake, `Ctrl+Z` (or right-click → *Undo remove*) restores the last one in its original position, including a folder with everything inside it. Undo is session-only: after a restart the history is empty, which matches the tree itself. An entry that came back on its own because its document is still open is reported as *Already back* instead of being duplicated.
+
 ### Switch to a file
 
 Single-click a file node (or press `Enter` on it) to switch Notepad++'s focus to that file's tab. If the file is no longer open, it's reopened from disk.
 
-Double-click renames the real saved file after a warning, or opens Save As for an unsaved buffer. A long press arms the destructive gesture visibly: once the threshold passes, the pressed row shows a red close badge (a filled circle with an ×) and its label turns red, while the status line reads *Release to close: …*. Releasing then runs the native close flow and removes the virtual entry only after the close succeeds. On a folder the same gesture means *remove this entry*: it asks first, always — even for an empty folder — and never closes tabs or deletes files. Moving the pointer first turns the press into a drag and drops the gesture, badge included.
+Double-click renames the real saved file after a warning, or opens Save As for an unsaved buffer. A long press arms the destructive gesture visibly: once the threshold passes, the pressed row shows a red close badge (a filled circle with an ×) and its label turns red, while the status line reads *Release to close: …*. Releasing then runs the native close flow and removes the virtual entry only after the close succeeds. On a folder the same gesture means *remove this entry*: it asks first, always — even for an empty folder — and never closes tabs or deletes files. Moving the pointer first turns the press into a drag and drops the gesture, badge included. A right click while the left button is still held cancels it outright: the badge disappears, the status line says *Cancelled — nothing was closed or removed.*, and no context menu opens.
 
 Clicking a folder only selects it — the tab set never changes. Double-clicking a folder expands or collapses it. To replace every unpinned tab with that folder's files, use *Replace workspace with folder files…* in the folder's context menu; it lists the tabs that would close and asks before doing anything.
 
@@ -178,6 +184,7 @@ An unsaved buffer is identified by its buffer name, because that is all it has: 
 | `Enter` | On a file node in the panel | Open / switch to the file |
 | `F2` | On any node in the panel | Rename (display label only) |
 | `Delete` | On any node in the panel | Remove from the panel (whole multi-selection; confirms for unsaved/modified entries and non-empty folders) |
+| `Ctrl+Z` | In the panel | Undo the most recent removal (same as right-click → *Undo remove*) |
 | `Ctrl+N` | In the panel | New folder under the current selection (or root) |
 | `Ctrl+Shift+A` | In the panel | Add the currently-active Notepad++ file |
 | `Ctrl+Shift+Alt+A` | In the panel | Add all currently-open files |
@@ -196,6 +203,8 @@ Everything the plugin persists lives under your Notepad++ plugin config director
 | File | Purpose |
 |---|---|
 | `state.json` | The virtual tree (folders, files, expanded state, last selection). Human-readable JSON. |
+| `state.json.bak-yyyyMMdd-HHmmss-fff-<random>` | Automatic snapshot of `state.json` taken at startup, before a session can change it. The newest five are kept. Copy one back over `state.json` to return to an earlier tree. |
+| `state.json.foreign-yyyyMMdd-HHmmss-fff-<random>` | Copy of a `state.json` that another Notepad++ window wrote while this one was running. Created only when such a change is detected; the newest five are kept. |
 | `state.json.corrupt-yyyyMMdd-HHmmssZ-<random>` | Backups of state files the plugin couldn't parse. Created automatically if `state.json` is ever malformed. Safe to delete once you've inspected them. |
 | `plugin.log` | Diagnostic log written by every plugin session. Useful if something misbehaves. |
 
@@ -252,7 +261,7 @@ For `x86`, swap the `/p:Platform=` value. **ARM64 is not currently supported** �
 dotnet test tests\VirtualTabGroups.Tests\VirtualTabGroups.Tests.csproj --nologo
 ```
 
-The test project covers the model layer (StateStore, TreeMutator, NodeJsonConverter, AliasResolver, theme manager, observer) — 94 unit tests at the time of writing. Panel decisions (add target, duplicate detection, removal confirmation, status text) live in `Core/` as pure functions so they are covered as well. UI behavior is verified manually inside Notepad++ since WinForms doesn't lend itself to automated testing without a real message loop.
+The test project covers the model layer (StateStore, TreeMutator, NodeJsonConverter, AliasResolver, theme manager, observer) plus the newer decision seams (relink precedence, press gesture, undo history, state snapshots) — 163 unit tests at the time of writing. Panel decisions (add target, duplicate detection, removal confirmation, status text) live in `Core/` as pure functions so they are covered as well. UI behavior is verified manually inside Notepad++ since WinForms doesn't lend itself to automated testing without a real message loop.
 
 ### Local install for testing
 
